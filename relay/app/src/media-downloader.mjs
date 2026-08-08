@@ -39,6 +39,20 @@ const MEDIA_EXTENSIONS = new Set([
   ".wav",
 ]);
 
+const GALLERY_PREFERRED_HOSTS = new Set([
+  "instagram.com",
+  "instagr.am",
+  "x.com",
+  "twitter.com",
+  "reddit.com",
+  "redd.it",
+  "pinterest.com",
+  "pin.it",
+  "bsky.app",
+  "threads.net",
+  "threads.com",
+]);
+
 function normaliseError(error) {
   if (error instanceof Error) {
     return error.message;
@@ -47,37 +61,59 @@ function normaliseError(error) {
   return String(error);
 }
 
-function cookieSourceForUrl(rawUrl) {
+function normalisedHostname(rawUrl) {
   try {
-    const hostname = new URL(rawUrl)
+    return new URL(rawUrl)
       .hostname
       .toLowerCase()
       .replace(/^www\./u, "");
-
-    const isYouTube =
-      hostname === "youtu.be" ||
-      hostname === "youtube.com" ||
-      hostname.endsWith(".youtube.com");
-
-    if (
-      isYouTube &&
-      YOUTUBE_COOKIE_FILE
-    ) {
-      return YOUTUBE_COOKIE_FILE;
-    }
-
-    const isInstagram =
-      hostname === "instagram.com" ||
-      hostname.endsWith(".instagram.com");
-
-    if (
-      isInstagram &&
-      INSTAGRAM_COOKIE_FILE
-    ) {
-      return INSTAGRAM_COOKIE_FILE;
-    }
   } catch {
-    return null;
+    return "";
+  }
+}
+
+function hostnameMatches(hostname, candidate) {
+  return (
+    hostname === candidate ||
+    hostname.endsWith(`.${candidate}`)
+  );
+}
+
+function isGalleryPreferred(rawUrl) {
+  const hostname = normalisedHostname(rawUrl);
+
+  for (const candidate of GALLERY_PREFERRED_HOSTS) {
+    if (hostnameMatches(hostname, candidate)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function cookieSourceForUrl(rawUrl) {
+  const hostname = normalisedHostname(rawUrl);
+
+  const isYouTube =
+    hostnameMatches(hostname, "youtube.com") ||
+    hostname === "youtu.be";
+
+  if (
+    isYouTube &&
+    YOUTUBE_COOKIE_FILE
+  ) {
+    return YOUTUBE_COOKIE_FILE;
+  }
+
+  const isInstagram =
+    hostnameMatches(hostname, "instagram.com") ||
+    hostname === "instagr.am";
+
+  if (
+    isInstagram &&
+    INSTAGRAM_COOKIE_FILE
+  ) {
+    return INSTAGRAM_COOKIE_FILE;
   }
 
   return null;
@@ -161,6 +197,11 @@ function isMediaFile(filePath) {
   return MEDIA_EXTENSIONS.has(
     path.extname(filePath).toLowerCase(),
   );
+}
+
+async function collectMediaFiles(outputDir) {
+  return (await walkFiles(outputDir))
+    .filter(isMediaFile);
 }
 
 function metadataFromInfo(info, sourceUrl) {
@@ -406,9 +447,14 @@ async function createArchive({
     metadata?.description || "",
   ).trim();
 
+  const captionPath = path.join(
+    outputDir,
+    "caption.txt",
+  );
+
   if (caption) {
     await writeFile(
-      path.join(outputDir, "caption.txt"),
+      captionPath,
       `${caption}\n`,
       { mode: 0o600 },
     );
@@ -441,7 +487,23 @@ async function createArchive({
     );
   }
 
-  return archivePath;
+  return {
+    archivePath,
+    captionPath: caption ? captionPath : null,
+  };
+}
+
+async function pruneArchiveSources({
+  files,
+  captionPath,
+}) {
+  for (const filePath of files) {
+    await rm(filePath, { force: true });
+  }
+
+  if (captionPath) {
+    await rm(captionPath, { force: true });
+  }
 }
 
 export function classifyDownloadError(errorText) {
@@ -479,6 +541,36 @@ export function classifyDownloadError(errorText) {
   return "download_failed";
 }
 
+async function runEngineAndCollect({
+  engine,
+  url,
+  outputDir,
+  tempDir,
+  cookieFile,
+  attempts,
+}) {
+  const result = engine === "gallery-dl"
+    ? await runGalleryDl({
+        url,
+        outputDir,
+        cookieFile,
+      })
+    : await runYtDlp({
+        url,
+        outputDir,
+        tempDir,
+        cookieFile,
+      });
+
+  attempts.push({
+    engine,
+    code: result.code,
+    error: result.stderr.trim(),
+  });
+
+  return collectMediaFiles(outputDir);
+}
+
 export async function downloadMedia({
   url,
   jobId,
@@ -503,187 +595,197 @@ export async function downloadMedia({
     recursive: true,
   });
 
-  const cookieFile = await copyCookieForJob(
-    url,
-    tempDir,
-  );
-
-  log("download_configuration", {
-    job_id: jobId,
-    source_host: new URL(url).hostname,
-    cookie_enabled: Boolean(cookieFile),
-  });
-
-  let metadata = await extractMetadata({
-    url,
-    cookieFile,
-  });
-
-  const attempts = [];
-
-  const ytResult = await runYtDlp({
-    url,
-    outputDir,
-    tempDir,
-    cookieFile,
-  });
-
-  attempts.push({
-    engine: "yt-dlp",
-    code: ytResult.code,
-    error: ytResult.stderr.trim(),
-  });
-
-  if (!metadata) {
-    metadata = await findInfoMetadata(
-      outputDir,
+  try {
+    const cookieFile = await copyCookieForJob(
       url,
+      tempDir,
     );
-  }
 
-  let files = (await walkFiles(outputDir))
-    .filter(isMediaFile);
+    log("download_configuration", {
+      job_id: jobId,
+      source_host: normalisedHostname(url),
+      cookie_enabled: Boolean(cookieFile),
+      preferred_engine:
+        isGalleryPreferred(url)
+          ? "gallery-dl"
+          : "yt-dlp",
+    });
 
-  if (files.length === 0) {
-    const galleryResult = await runGalleryDl({
+    let metadata = await extractMetadata({
       url,
-      outputDir,
       cookieFile,
     });
 
-    attempts.push({
-      engine: "gallery-dl",
-      code: galleryResult.code,
-      error: galleryResult.stderr.trim(),
+    const attempts = [];
+    let files = [];
+
+    const firstEngine =
+      isGalleryPreferred(url)
+        ? "gallery-dl"
+        : "yt-dlp";
+
+    const secondEngine =
+      firstEngine === "gallery-dl"
+        ? "yt-dlp"
+        : "gallery-dl";
+
+    files = await runEngineAndCollect({
+      engine: firstEngine,
+      url,
+      outputDir,
+      tempDir,
+      cookieFile,
+      attempts,
     });
 
-    files = (await walkFiles(outputDir))
-      .filter(isMediaFile);
-  }
-
-  if (files.length === 0) {
-    try {
-      const linkedInResult =
-        await downloadLinkedInPublicImages({
-          url,
-          outputDir,
-          log,
-        });
-
-      if (linkedInResult.supported) {
-        attempts.push({
-          engine: "linkedin-public-html",
-          code:
-            linkedInResult.files.length > 0
-              ? 0
-              : 1,
-          error:
-            linkedInResult.files.length > 0
-              ? ""
-              : "No public post images discovered",
-        });
-
-        files = linkedInResult.files;
-
-        if (!metadata && linkedInResult.metadata) {
-          metadata = linkedInResult.metadata;
-        }
-      }
-    } catch (error) {
-      attempts.push({
-        engine: "linkedin-public-html",
-        code: 1,
-        error: normaliseError(error),
+    if (files.length === 0) {
+      files = await runEngineAndCollect({
+        engine: secondEngine,
+        url,
+        outputDir,
+        tempDir,
+        cookieFile,
+        attempts,
       });
     }
-  }
 
-  await removeInfoJsonFiles(outputDir);
+    if (!metadata) {
+      metadata = await findInfoMetadata(
+        outputDir,
+        url,
+      );
+    }
 
-  files = (await walkFiles(outputDir))
-    .filter(isMediaFile);
+    if (files.length === 0) {
+      try {
+        const linkedInResult =
+          await downloadLinkedInPublicImages({
+            url,
+            outputDir,
+            log,
+          });
 
-  if (files.length === 0) {
-    const combinedError = attempts
-      .map((attempt) =>
-        `${attempt.engine}: ${attempt.error || `exit ${attempt.code}`}`,
-      )
-      .join(" | ");
+        if (linkedInResult.supported) {
+          attempts.push({
+            engine: "linkedin-public-html",
+            code:
+              linkedInResult.files.length > 0
+                ? 0
+                : 1,
+            error:
+              linkedInResult.files.length > 0
+                ? ""
+                : "No public post images discovered",
+          });
 
-    const error = new Error(
-      combinedError || "No downloadable media found.",
-    );
+          files = linkedInResult.files;
 
-    error.code = classifyDownloadError(combinedError);
-    error.attempts = attempts;
+          if (!metadata && linkedInResult.metadata) {
+            metadata = linkedInResult.metadata;
+          }
+        }
+      } catch (error) {
+        attempts.push({
+          engine: "linkedin-public-html",
+          code: 1,
+          error: normaliseError(error),
+        });
+      }
+    }
 
-    await rm(outputDir, {
-      recursive: true,
-      force: true,
-    });
+    await removeInfoJsonFiles(outputDir);
+    files = await collectMediaFiles(outputDir);
 
-    throw error;
-  }
+    if (files.length === 0) {
+      const combinedError = attempts
+        .map((attempt) =>
+          `${attempt.engine}: ${attempt.error || `exit ${attempt.code}`}`,
+        )
+        .join(" | ");
 
-  const aggregateSize = await totalSize(files);
-  const maxBytes =
-    MAX_FILE_SIZE_MB * 1024 * 1024;
+      const error = new Error(
+        combinedError || "No downloadable media found.",
+      );
 
-  if (aggregateSize > maxBytes) {
-    await rm(outputDir, {
-      recursive: true,
-      force: true,
-    });
+      error.code = classifyDownloadError(combinedError);
+      error.attempts = attempts;
 
-    const error = new Error(
-      `Media bundle exceeds ${MAX_FILE_SIZE_MB} MB.`,
-    );
-    error.code = "size_limit";
-    throw error;
-  }
+      await rm(outputDir, {
+        recursive: true,
+        force: true,
+      });
 
-  let artifactPath;
-  let previewKind = "file";
-  let mimeType = "application/octet-stream";
-  let isArchive = false;
+      throw error;
+    }
 
-  if (files.length > 1) {
-    artifactPath = await createArchive({
-      outputDir,
-      metadata,
-    });
-    previewKind = "file";
-    mimeType = "application/zip";
-    isArchive = true;
-  } else {
-    [artifactPath] = files;
-    [mimeType, previewKind] = classifyMime(
+    const aggregateSize = await totalSize(files);
+    const maxBytes =
+      MAX_FILE_SIZE_MB * 1024 * 1024;
+
+    if (aggregateSize > maxBytes) {
+      await rm(outputDir, {
+        recursive: true,
+        force: true,
+      });
+
+      const error = new Error(
+        `Media bundle exceeds ${MAX_FILE_SIZE_MB} MB.`,
+      );
+      error.code = "size_limit";
+      throw error;
+    }
+
+    const mediaCount = files.length;
+    let artifactPath;
+    let previewKind = "file";
+    let mimeType = "application/octet-stream";
+    let isArchive = false;
+
+    if (files.length > 1) {
+      const archive = await createArchive({
+        outputDir,
+        metadata,
+      });
+
+      artifactPath = archive.archivePath;
+      previewKind = "file";
+      mimeType = "application/zip";
+      isArchive = true;
+
+      await pruneArchiveSources({
+        files,
+        captionPath: archive.captionPath,
+      });
+    } else {
+      [artifactPath] = files;
+      [mimeType, previewKind] = classifyMime(
+        artifactPath,
+      );
+    }
+
+    const artifactStat = await stat(artifactPath);
+
+    return {
       artifactPath,
-    );
+      artifactName: path.basename(artifactPath),
+      artifactSize: artifactStat.size,
+      mimeType,
+      previewKind,
+      isArchive,
+      mediaCount,
+      metadata: metadata || {
+        title: "",
+        description: "",
+        uploader: "",
+        extractor: "",
+        webpage_url: url,
+      },
+      attempts,
+    };
+  } finally {
+    await rm(tempDir, {
+      recursive: true,
+      force: true,
+    });
   }
-
-  const artifactStat = await stat(artifactPath);
-
-  await rm(tempDir, {
-    recursive: true,
-    force: true,
-  });
-
-  return {
-    artifactPath,
-    artifactName: path.basename(artifactPath),
-    artifactSize: artifactStat.size,
-    mimeType,
-    previewKind,
-    isArchive,
-    mediaCount: files.length,
-    metadata: metadata || {
-      title: "",
-      description: "",
-      uploader: "",
-      extractor: "",
-      webpage_url: url,
-    },
-    attempts,
-  };
 }
