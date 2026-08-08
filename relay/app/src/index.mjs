@@ -27,6 +27,10 @@ const MAX_CONCURRENT_DOWNLOADS = Number(
 const MAX_FILE_SIZE_MB = Number(
   process.env.MAX_FILE_SIZE_MB || "2000",
 );
+const PUBLIC_BASE_URL =
+  process.env.PUBLIC_BASE_URL
+    ?.trim()
+    .replace(/\/+$/u, "") || "";
 
 const ALLOWED_PRIVATE_USER_IDS = new Set(
   (process.env.ALLOWED_PRIVATE_USER_IDS || "")
@@ -233,22 +237,52 @@ async function editStatus(
     chat_id: job.chatId,
     message_id: job.statusMessageId,
     text,
+    ...(replyMarkup
+      ? { reply_markup: replyMarkup }
+      : {}),
+    link_preview_options: previewUrl
+      ? {
+          is_disabled: false,
+          url: previewUrl,
+          prefer_large_media: true,
+          show_above_text: true,
+        }
+      : { is_disabled: true },
   };
 
-  if (replyMarkup) {
-    payload.reply_markup = replyMarkup;
-  }
+  try {
+    await telegram("editMessageText", payload);
+    return true;
+  } catch (error) {
+    if (previewUrl) {
+      log("telegram_preview_failed", {
+        job_id: job.id,
+        error: normaliseError(error),
+      });
 
-  payload.link_preview_options = previewUrl
-    ? {
-        is_disabled: false,
-        url: previewUrl,
-        prefer_large_media: true,
-        show_above_text: true,
+      try {
+        await telegram("editMessageText", {
+          ...payload,
+          link_preview_options: {
+            is_disabled: true,
+          },
+        });
+        return false;
+      } catch (fallbackError) {
+        log("status_edit_failed", {
+          job_id: job.id,
+          error: normaliseError(fallbackError),
+        });
+        return false;
       }
-    : { is_disabled: true };
+    }
 
-  await telegram("editMessageText", payload);
+    log("status_edit_failed", {
+      job_id: job.id,
+      error: normaliseError(error),
+    });
+    return false;
+  }
 }
 
 function splitText(value, maxLength = 3600) {
@@ -290,24 +324,32 @@ async function sendCaptionContinuation(
   downloadUrl,
 ) {
   for (let index = 0; index < chunks.length; index += 1) {
-    await telegram("sendMessage", {
-      chat_id: job.chatId,
-      text: [
-        index === 0
-          ? "📝 ادامه کپشن:"
-          : "📝 ادامه:",
-        chunks[index],
-        "",
-        `⬇️ ${downloadUrl}`,
-      ].join("\n"),
-      reply_parameters: {
-        message_id: job.sourceMessageId,
-        allow_sending_without_reply: true,
-      },
-      link_preview_options: {
-        is_disabled: true,
-      },
-    });
+    try {
+      await telegram("sendMessage", {
+        chat_id: job.chatId,
+        text: [
+          index === 0
+            ? "📝 ادامه کپشن:"
+            : "📝 ادامه:",
+          chunks[index],
+          "",
+          `⬇️ ${downloadUrl}`,
+        ].join("\n"),
+        reply_parameters: {
+          message_id: job.sourceMessageId,
+          allow_sending_without_reply: true,
+        },
+        link_preview_options: {
+          is_disabled: true,
+        },
+      });
+    } catch (error) {
+      log("caption_send_failed", {
+        job_id: job.id,
+        chunk_index: index,
+        error: normaliseError(error),
+      });
+    }
   }
 }
 
@@ -404,7 +446,8 @@ function buildCompletion({
   lines.push(
     "",
     "⬇️ لینک دانلود:",
-    access.downloadUrl,
+    access.downloadUrl ||
+      "PUBLIC_BASE_URL تنظیم نشده است.",
     "",
     "⚠️ این لینک پس از ۲۴ ساعت منقضی می‌شود، مگر اینکه توسط کاربر مجاز دائمی شود.",
   );
@@ -476,7 +519,10 @@ async function processJob(job) {
       access.previewUrl,
     );
 
-    if (completion.remainingCaption) {
+    if (
+      completion.remainingCaption &&
+      access.downloadUrl
+    ) {
       await sendCaptionContinuation(
         job,
         splitText(completion.remainingCaption),
@@ -626,19 +672,34 @@ async function handleCallbackQuery(callbackQuery) {
       "\n\n♾️ این فایل دائمی شده و دیگر به‌صورت خودکار حذف نمی‌شود.";
   }
 
-  await telegram("editMessageText", {
-    chat_id: message.chat.id,
-    message_id: message.message_id,
-    text: updatedText,
-    link_preview_options: {
-      is_disabled: false,
-      prefer_large_media: true,
-      show_above_text: true,
-    },
-    reply_markup: {
-      inline_keyboard: [],
-    },
-  });
+  const callbackPreviewUrl =
+    PUBLIC_BASE_URL
+      ? `${PUBLIC_BASE_URL}/p/${token}`
+      : null;
+
+  try {
+    await telegram("editMessageText", {
+      chat_id: message.chat.id,
+      message_id: message.message_id,
+      text: updatedText,
+      link_preview_options: callbackPreviewUrl
+        ? {
+            is_disabled: false,
+            url: callbackPreviewUrl,
+            prefer_large_media: true,
+            show_above_text: true,
+          }
+        : { is_disabled: true },
+      reply_markup: {
+        inline_keyboard: [],
+      },
+    });
+  } catch (error) {
+    log("persistent_message_edit_failed", {
+      user_id: userId,
+      error: normaliseError(error),
+    });
+  }
 
   log("persistent_callback_completed", {
     user_id: userId,
