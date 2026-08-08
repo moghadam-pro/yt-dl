@@ -66,6 +66,14 @@ function publicUrlForToken(token) {
   return `${PUBLIC_BASE_URL}/d/${token}`;
 }
 
+function mediaUrlForToken(token) {
+  if (!PUBLIC_BASE_URL) {
+    return null;
+  }
+
+  return `${PUBLIC_BASE_URL}/m/${token}`;
+}
+
 function previewUrlForToken(token) {
   if (!PUBLIC_BASE_URL) {
     return null;
@@ -108,16 +116,12 @@ function escapeHeaderFilename(fileName) {
     .replace(/["\\]/gu, "_");
 }
 
-function contentDisposition(record) {
+function contentDisposition(record, inline) {
   const fallbackName = escapeHeaderFilename(
     record.fileName,
   );
 
-  const mode = ["video", "image"].includes(
-    record.previewKind,
-  )
-    ? "inline"
-    : "attachment";
+  const mode = inline ? "inline" : "attachment";
 
   return (
     `${mode}; filename="${fallbackName}"; ` +
@@ -426,6 +430,10 @@ export async function registerDownload({
       token,
       expiresAt,
       downloadUrl: publicUrlForToken(token),
+      mediaUrl:
+        previewKind === "file"
+          ? null
+          : mediaUrlForToken(token),
       previewUrl:
         previewKind === "file"
           ? null
@@ -467,7 +475,12 @@ async function getAvailableRecord(token) {
   }
 }
 
-async function serveDownload(request, response, token) {
+async function serveDownload(
+  request,
+  response,
+  token,
+  { inline = false } = {},
+) {
   const available = await getAvailableRecord(token);
 
   if (available.status === "not_found") {
@@ -511,7 +524,10 @@ async function serveDownload(request, response, token) {
       record.fileName,
       record.mimeType,
     ),
-    "content-disposition": contentDisposition(record),
+    "content-disposition": contentDisposition(
+      record,
+      inline,
+    ),
     "x-content-type-options": "nosniff",
   };
 
@@ -562,7 +578,7 @@ async function serveDownload(request, response, token) {
   stream.pipe(response);
 }
 
-async function servePreview(response, token) {
+async function servePreview(request, response, token) {
   const available = await getAvailableRecord(token);
 
   if (available.status !== "ok") {
@@ -582,29 +598,30 @@ async function servePreview(response, token) {
   }
 
   const { record } = available;
-  const directUrl = publicUrlForToken(token);
+  const mediaUrl = mediaUrlForToken(token);
+  const previewUrl = previewUrlForToken(token);
   const title = htmlEscape(
     record.title || record.fileName,
   );
   const mime = htmlEscape(
     contentTypeForFile(record.fileName, record.mimeType),
   );
-  const mediaUrl = htmlEscape(directUrl);
+  const escapedMediaUrl = htmlEscape(mediaUrl);
 
   const mediaMeta =
     record.previewKind === "video"
       ? [
           '<meta property="og:type" content="video.other">',
-          `<meta property="og:video" content="${mediaUrl}">`,
-          `<meta property="og:video:secure_url" content="${mediaUrl}">`,
+          `<meta property="og:video" content="${escapedMediaUrl}">`,
+          `<meta property="og:video:secure_url" content="${escapedMediaUrl}">`,
           `<meta property="og:video:type" content="${mime}">`,
         ].join("\n")
       : record.previewKind === "image"
         ? [
             '<meta property="og:type" content="article">',
-            `<meta property="og:image" content="${mediaUrl}">`,
+            `<meta property="og:image" content="${escapedMediaUrl}">`,
             '<meta name="twitter:card" content="summary_large_image">',
-            `<meta name="twitter:image" content="${mediaUrl}">`,
+            `<meta name="twitter:image" content="${escapedMediaUrl}">`,
           ].join("\n")
         : '<meta property="og:type" content="website">';
 
@@ -615,11 +632,11 @@ async function servePreview(response, token) {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${title}</title>
 <meta property="og:title" content="${title}">
-<meta property="og:url" content="${htmlEscape(previewUrlForToken(token))}">
+<meta property="og:url" content="${htmlEscape(previewUrl)}">
 ${mediaMeta}
 </head>
 <body>
-<p><a href="${mediaUrl}">Open media</a></p>
+<p><a href="${htmlEscape(publicUrlForToken(token))}">Download media</a></p>
 </body>
 </html>`;
 
@@ -628,6 +645,12 @@ ${mediaMeta}
     "cache-control": "private, no-store",
     "x-content-type-options": "nosniff",
   });
+
+  if (request.method === "HEAD") {
+    response.end();
+    return;
+  }
+
   response.end(html);
 }
 
@@ -676,6 +699,22 @@ function startHttpServer() {
             request,
             response,
             downloadMatch[1],
+            { inline: false },
+          );
+          return;
+        }
+
+        const mediaMatch =
+          /^\/m\/([A-Za-z0-9_-]{20,})$/u.exec(
+            requestUrl.pathname,
+          );
+
+        if (mediaMatch) {
+          await serveDownload(
+            request,
+            response,
+            mediaMatch[1],
+            { inline: true },
           );
           return;
         }
@@ -686,15 +725,8 @@ function startHttpServer() {
           );
 
         if (previewMatch) {
-          if (request.method === "HEAD") {
-            response.writeHead(200, {
-              "content-type": "text/html; charset=utf-8",
-            });
-            response.end();
-            return;
-          }
-
           await servePreview(
+            request,
             response,
             previewMatch[1],
           );
