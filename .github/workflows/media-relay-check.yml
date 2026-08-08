@@ -1,0 +1,46 @@
+name: Media relay checks
+
+on:
+  push:
+    paths:
+      - "relay/**"
+      - "docs/**"
+      - "README.md"
+      - ".github/workflows/media-relay-check.yml"
+  pull_request:
+    paths:
+      - "relay/**"
+      - "docs/**"
+      - "README.md"
+      - ".github/workflows/media-relay-check.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  syntax-and-safety:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+
+      - name: Check JavaScript syntax
+        run: |
+          node --check relay/app/src/index.mjs
+          node --check relay/app/src/media-downloader.mjs
+          node --check relay/app/src/download-store.mjs
+          node --check relay/app/src/linkedin-fallback.mjs
+
+      - name: Validate Compose file
+        run: docker compose -f relay/docker-compose.yml config --quiet
+
+      - name: Ensure production secret files are not tracked
+        run: |
+          ! git ls-files relay/.env | grep -q .
+          ! git ls-files 'relay/runtime/**' | grep -q .
+          ! git ls-files 'relay/**/*.pem' | grep -q .
+          ! git ls-files 'relay/**/*.key' | grep -q .
+          ! git ls-files 'relay/**/cookies.txt' | grep -q .
