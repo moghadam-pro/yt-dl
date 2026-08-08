@@ -1,0 +1,14 @@
+{
+  "name": "mpro-media-relay",
+  "version": "0.4.0",
+  "private": true,
+  "type": "module",
+  "description": "Telegram media relay with yt-dlp, gallery-dl, expiring download links, and gallery ZIP support",
+  "scripts": {
+    "start": "node src/index.mjs",
+    "check": "node --check src/index.mjs && node --check src/media-downloader.mjs && node --check src/download-store.mjs && node --check src/linkedin-fallback.mjs"
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}
